@@ -97,6 +97,17 @@ BOOL APIENTRY DllMain(HMODULE H, DWORD Reason, LPVOID P)
             if (errno_t err = freopen_s(&f, "CONOUT$", "w", stderr))
                 GameData::Com_Error(0, "freopen_s(stderr) %s", strerror_s<0x40>(errDesc, err));
 
+            // Start the console minimised. It is still in the taskbar whenever
+            // its output is wanted, but it never takes the foreground away from
+            // a fullscreen game.
+            //
+            // Not sufficient on its own: the window belongs to the console host
+            // process and can be created, and activated, after DllMain has
+            // already returned. GameData::KeepConsoleMinimized covers that from
+            // the render thread.
+            if (HWND console = GetConsoleWindow())
+                ShowWindow(console, SW_SHOWMINNOACTIVE);
+
             // Detour all the functions designated
             InsertDetour(&GameData::Menu_PaintAll, GameData::Menu_PaintAllDetourInvoke);
             InsertDetour(&GameData::TopLevelExceptionFilter, GameData::TopLevelExceptionFilterDetour);

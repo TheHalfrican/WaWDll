@@ -237,6 +237,10 @@ namespace GameData
     int Com_PrintfDetour(int channel, const char *format, ...);
 }
 
+// Key that shows and hides the menu. Insert rather than Home, because ReShade
+// binds Home by default and both overlays would open on the same press.
+#define MENU_TOGGLE_KEY VK_INSERT
+
 enum ScreenAlignment : char
 {
     ALIGN_LEFT,
@@ -259,7 +263,14 @@ enum OptionType : char
     TYPE_INT,
     TYPE_FLOAT,
     TYPE_BOOL,
-    TYPE_VOID
+    TYPE_VOID,
+    // A console command that the game treats as a toggle, such as god mode.
+    // The game owns the real state and never reports it back, so all this
+    // tracks is what has been clicked here. Drawn as On/Off text rather than
+    // the checkbox used by TYPE_BOOL, so a value we cannot verify never looks
+    // like one we can, and deliberately not persisted to WaWDll.cfg since the
+    // game starts every session with these off
+    TYPE_TOGGLE
 };
 
 namespace Colors
@@ -296,7 +307,7 @@ namespace Fonts
 }
 
 // Local storage of the used game dvar structure
-extern std::unordered_map<const char *, GameData::dvar_s *> dvars;
+extern std::unordered_map<std::string, GameData::dvar_s *> dvars;
 
 // The data stored inside each option
 struct OptionData
@@ -355,6 +366,16 @@ struct Menu
     Submenu currentSub;
     // Used to delay the speed of activing an option again
     unsigned int timer;
+    // Previous state of MENU_TOGGLE_KEY, so the toggle fires on the press
+    // itself rather than repeatedly while the key is held down
+    bool toggleKeyWasDown;
+    // Mouse button edge state, sampled once per frame in Menu::MonitorKeys and
+    // read by Menu::MonitorMouse. Sampling has to happen outside the per-option
+    // loop, otherwise every option in the list would consume its own edge
+    bool leftWasDown;
+    bool rightWasDown;
+    bool leftPressed;
+    bool rightPressed;
 
     /**
      * @brief Initializes menu and inserts all options into it
@@ -383,6 +404,27 @@ struct Menu
      * @brief Handles where to go when user exits a submenu
     **/
     void CloseSub();
+
+    /**
+     * @brief Writes every bool and int option to WaWDll.cfg beside the DLL.
+     *        Called when the menu closes and after each single click change
+    **/
+    void SaveSettings();
+
+    /**
+     * @brief Reads WaWDll.cfg back into the options. Unknown or malformed
+     *        entries are skipped, so an old or hand edited file cannot break
+     *        start up. Call before Menu::ApplySettings
+    **/
+    void LoadSettings();
+
+    /**
+     * @brief Pushes restored option values into the game. Options that act
+     *        through a dvar or a code patch only do so from their click
+     *        callback, so a value loaded from disk has no effect until this
+     *        runs. Options that are read every frame need nothing
+    **/
+    void ApplySettings();
 
     /**
      * @brief Sets the menu timer which causes a wait to process input

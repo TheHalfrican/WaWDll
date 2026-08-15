@@ -518,34 +518,17 @@ namespace GameData
     void VM_NotifyDetour(scriptInstance_t inst, int notifyListOwnerId,
         int stringValue, VariableValue *top)
     {
-        LPCSTR notifyString = SL_ConvertToString(stringValue);
-        if (!strcmp(notifyString, "spawned_player"))
-            std::cout << "born" << std::endl;
-        if (!strcmp(notifyString, "weapon_fired"))
-        {
-            int functype;
-            GameData::scriptInstance_t newInst;
-
-            GScr_MagicBullet(cgameGlob->clientNum, /*ptrs41_zombie*/"panzerschrek");
-
-            // Get the GSC script function/method and pass the arguments
-            void *script = GetFunctionOrMethod("anglestoforward", &functype, &newInst);
-
-            switch (functype)
-            {
-                case 0:
-                    std::cout << "MEthod " << newInst << std::endl;
-                    CopyAddressToClipboard(script);
-                break;
-                case 1:
-                    std::cout << "Function " << newInst << std::endl;
-                    CopyAddressToClipboard(script);
-                break;
-                default:
-                    std::cout << "Not found\n";
-                break;
-            }
-        }
+        // This detour must stay side effect free.
+        //
+        // It exists as an entry point for the unfinished host menu, but it fires
+        // on every script notify the game raises. It previously carried leftover
+        // experiments that ran unconditionally, the worst being a
+        // GScr_MagicBullet("panzerschrek") on every "weapon_fired" notify, which
+        // spawned a rocket every time any weapon was fired by anyone. Nothing
+        // gated it, so it applied from the moment the DLL was injected.
+        //
+        // Anything added here runs for every notify in the game. Gate it behind
+        // a menu option before turning it back on.
 
         //TEST(
         //    for (int i = 0; i < 0x60C; i += 0xC)
@@ -571,7 +554,7 @@ namespace GameData
         //    return;
 
         //DWORD threadId = GetVariableKeyObject(inst, notifyListIndex);
-        int self = Scr_GetSelf(inst, notifyListOwnerId);
+        //int self = Scr_GetSelf(inst, notifyListOwnerId);
     }
 }
 

@@ -109,6 +109,30 @@ namespace GameData
         }
     }
 
+    // True while the player is sighted, under either aim setting.
+    //
+    // World at War rebinds the aim key depending on the Aim Down Sight setting:
+    // "+speed_throw" for hold, "+toggleads_throw" for toggle. Only one of them
+    // is ever bound at a time, and the game rewrites config.cfg when the
+    // setting changes, so both names have to be checked. Testing just one is
+    // why this silently did nothing before.
+    //
+    // The key alone is not enough either. Under the toggle setting the key is
+    // down for a single moment and the player stays sighted long after it is
+    // released, so a key check would engage the aimbot for one frame and drop
+    // it. fWeaponPosFrac is the weapon's ADS transition fraction, 0 at the hip
+    // and 1 fully sighted, so it describes the state rather than the input.
+    //
+    // Keys are checked first so that under the hold setting the aimbot engages
+    // the instant the button goes down, rather than partway through the raise.
+    bool IsAimingDownSights()
+    {
+        if (Key_IsDown("+speed_throw") || Key_IsDown("+toggleads_throw"))
+            return true;
+
+        return cgameGlob->predictedPlayerState.fWeaponPosFrac > 0.5f;
+    }
+
     void (__cdecl *CL_CreateNewCommands)() = (void (__cdecl *)())CL_CreateNewCommands_a;
     void __declspec(naked) CL_CreateNewCommandsDetourInvoke()
     {
@@ -134,14 +158,14 @@ namespace GameData
         GameData::usercmd_s *ccmd = &GameData::clientActive->cmds[GameData::clientActive->cmdNumber & 0x7F];
         GameData::usercmd_s *ocmd = &GameData::clientActive->cmds[GameData::clientActive->cmdNumber - 1 & 0x7F];
 
-        ocmd->serverTime++;
-
         bool aimbotRun = false;
         bool isShooting = GameData::Key_IsDown("+attack");
         if (aimbot.enableAimbot.data.boolean)
         {
+            // Aim Key: 0 = always on, 1 = only while firing, 2 = only while
+            // aiming down sights. 2 is the default.
             if ((aimbot.aimKey.data.integer == 1 && isShooting)
-                || (aimbot.aimKey.data.integer == 2 && GameData::Key_IsDown("+speed_throw"))
+                || (aimbot.aimKey.data.integer == 2 && IsAimingDownSights())
                 || !aimbot.aimKey.data.integer)
             {
                 aimbotRun = aimbot.ExecuteAimbot();
@@ -152,8 +176,16 @@ namespace GameData
 
         if (aimbot.autoShoot.data.boolean && (aimbotRun || isShooting))
         {
+            // Reach back and set the fire bit on the previous command, which the
+            // client has built but not yet sent, so the shot goes out a frame
+            // earlier than it otherwise would.
             ccmd->button_bits &= ~1;
             ocmd->button_bits |= 1;
+
+            // Bumping its timestamp is what stops the server discarding that
+            // edited command as stale. Only meaningful alongside the edit above,
+            // so it stays inside this branch rather than running every frame.
+            ocmd->serverTime++;
         }
 
        // GameData::LeaveCriticalSection(&menu.critSection);

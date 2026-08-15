@@ -1,4 +1,8 @@
 #include "stdafx.hpp"
+// stdafx only pulls these in under _DEBUG, and settings persistence needs them
+// in any configuration
+#include <fstream>
+#include <string>
 #include "nonhost_menu.hpp"
 
 namespace GameData
@@ -466,10 +470,52 @@ namespace GameData
             ret
         }
     }
+    // Keeps the debug console from taking focus off a fullscreen game.
+    //
+    // The console window belongs to the console host process, not to us, and is
+    // created asynchronously, so minimising it in DllMain can run before the
+    // window even exists and the host may activate it afterwards regardless.
+    // This runs from the render thread to catch it whenever it turns up.
+    //
+    // Handing focus back with SetForegroundWindow was tried first, including
+    // with AttachThreadInput to lift the foreground restriction, and did not
+    // hold. Minimising does: ShowWindow on another process's window is not
+    // restricted the way SetForegroundWindow is, and minimising the foreground
+    // window makes Windows activate the one behind it, which is the game.
+    void KeepConsoleMinimized()
+    {
+        // Long enough to outlast a slow console host, short enough that
+        // restoring the console yourself is not fought for more than a moment
+        static unsigned int deadline = Sys_Milliseconds() + 3000;
+        static bool finished = false;
+
+        if (finished)
+            return;
+
+        if (Sys_Milliseconds() > deadline)
+        {
+            finished = true;
+            return;
+        }
+
+        HWND console = GetConsoleWindow();
+        if (!console || IsIconic(console))
+            return;
+
+        ShowWindow(console, SW_MINIMIZE);
+
+        // Minimising normally hands the foreground back by itself, but ask
+        // directly in case something else ended up in front
+        if (hwnd && *hwnd)
+            SetForegroundWindow(*hwnd);
+    }
+
     void Menu_PaintAllDetour(UiContext *dc)
     {
         Menu &menu = Menu::Instance();
        // EnterCriticalSection(&menu.critSection);
+
+        KeepConsoleMinimized();
 
         if (IN_IsForegroundWindow())
             menu.MonitorKeys();
@@ -477,7 +523,11 @@ namespace GameData
         if (menu.open)
             menu.Execute();
 
-        RenderESP();
+        // Gated on the menu option. This used to run unconditionally, so boxes
+        // were drawn from the moment the DLL was injected and the Enemy ESP
+        // toggle did nothing but flip its own checkbox.
+        if (menu.GetOptionData(ESP_MENU, "Enemy ESP").data.boolean)
+            RenderESP();
 
         /*
             To call a GSC method, you must reverse yyparse() in ScriptParse()
@@ -597,7 +647,7 @@ namespace GameData
     }
 }
 
-std::unordered_map<const char *, GameData::dvar_s *> dvars;
+std::unordered_map<std::string, GameData::dvar_s *> dvars;
 
 Fonts::Font Fonts::normalFont = { 1, "fonts/normalFont" };
 
@@ -616,6 +666,7 @@ OptionData::OptionData(OptionType type) : type(type)
             this->data = Data(0);
             break;
         case TYPE_BOOL:
+        case TYPE_TOGGLE:
             this->data = Data(false);
             break;
         case TYPE_FLOAT:
@@ -628,10 +679,15 @@ OptionData::OptionData(OptionType type) : type(type)
 }
 
 Menu::Menu() :
-    open(false), 
+    open(false),
     toggled(false),
     currentSub(MAIN_MENU),
-    timer(0)
+    timer(0),
+    toggleKeyWasDown(false),
+    leftWasDown(false),
+    rightWasDown(false),
+    leftPressed(false),
+    rightPressed(false)
 {
     GameData::InitializeCriticalSection(&this->critSection);
 
@@ -691,16 +747,6 @@ Menu::Menu() :
         { 
             Menu::Instance().IntModify("Aim Key", TYPE_INT, 0, 2); 
         });
-    Insert(AIMBOT_MENU, "Aim Type",  TYPE_INT, 
-        []() 
-        { 
-            Menu::Instance().IntModify("Aim Type", TYPE_INT, 0, 2); 
-        });
-    Insert(AIMBOT_MENU, "Auto Aim", TYPE_BOOL, 
-        []() 
-        { 
-            Menu::Instance().BoolModify("Auto Aim"); 
-        });
     Insert(AIMBOT_MENU, "Auto Shoot", TYPE_BOOL, 
         []() 
         { 
@@ -739,25 +785,31 @@ Menu::Menu() :
             dvars.at("sv_cheats")->current.enabled 
                 = Menu::Instance().BoolModify("Enable Cheats");
         });
-    Insert(MISC_MENU, "God Mode", TYPE_VOID, 
-        []() 
-        { 
-            GameData::Cbuf_AddText("god"); 
+    // The three below are toggles in the game, so they track what has been
+    // clicked and show it as On/Off. Give All Weapons is a one shot action with
+    // no state, so it stays a plain command with no indicator.
+    Insert(MISC_MENU, "God Mode", TYPE_TOGGLE,
+        []()
+        {
+            Menu::Instance().BoolModify("God Mode");
+            GameData::Cbuf_AddText("god");
         });
-    Insert(MISC_MENU, "No Clip", TYPE_VOID, 
-        []() 
-        { 
-            GameData::Cbuf_AddText("noclip"); 
+    Insert(MISC_MENU, "No Clip", TYPE_TOGGLE,
+        []()
+        {
+            Menu::Instance().BoolModify("No Clip");
+            GameData::Cbuf_AddText("noclip");
         });
-    Insert(MISC_MENU, "Give All Weapons", TYPE_VOID, 
-        []() 
-        { 
-            GameData::Cbuf_AddText("give all"); 
+    Insert(MISC_MENU, "Give All Weapons", TYPE_VOID,
+        []()
+        {
+            GameData::Cbuf_AddText("give all");
         });
-    Insert(MISC_MENU, "No Target", TYPE_VOID, 
-        []() 
-        { 
-            GameData::Cbuf_AddText("notarget"); 
+    Insert(MISC_MENU, "No Target", TYPE_TOGGLE,
+        []()
+        {
+            Menu::Instance().BoolModify("No Target");
+            GameData::Cbuf_AddText("notarget");
         });
     Insert(MISC_MENU, "Infinite Ammo", TYPE_BOOL, 
         []() 
@@ -776,7 +828,15 @@ Menu::Menu() :
         && InsertDvar("perk_weapSpreadMultiplier")
         && InsertDvar("sv_cheats")
         && InsertDvar("player_sustainAmmo"))
+    {
+        // Defaults first, so a saved file overrides them and a missing one
+        // still leaves every option somewhere sensible
         this->GetOptionData(MISC_MENU, "FOV").data.integer = 65;
+        this->GetOptionData(AIMBOT_MENU, "Aim Key").data.integer = 2;
+
+        this->LoadSettings();
+        this->ApplySettings();
+    }
     else
         GameData::Com_Error(0, "Dvars failed to load\n");
 }
@@ -813,6 +873,120 @@ void Menu::CloseSub()
             this->open = false;
             break;
     }
+
+    // Backing out of the last menu is one of the two ways the menu closes
+    if (!this->open)
+        this->SaveSettings();
+}
+
+// Settings live beside the DLL so they travel with it. __ImageBase is this
+// module's base address, which avoids having to thread the HMODULE from DllMain
+// down to here.
+EXTERN_C IMAGE_DOS_HEADER __ImageBase;
+
+static std::string SettingsPath()
+{
+    char path[MAX_PATH] = { 0 };
+    DWORD length = GetModuleFileNameA((HMODULE)&__ImageBase, path, MAX_PATH);
+    if (!length || length >= MAX_PATH)
+        return std::string();
+
+    std::string full(path, length);
+    size_t slash = full.find_last_of("\\/");
+    if (slash == std::string::npos)
+        return std::string();
+
+    return full.substr(0, slash + 1) + "WaWDll.cfg";
+}
+
+void Menu::SaveSettings()
+{
+    const std::string path = SettingsPath();
+    if (path.empty())
+        return;
+
+    std::ofstream file(path, std::ios::trunc);
+    if (!file)
+        return;
+
+    file << "# WaWDll settings. Rewritten whenever the menu closes.\n";
+    file << "# Format: submenu|option=value. Delete this file to reset.\n";
+
+    for (size_t sub = 0; sub < this->options.size(); sub++)
+    {
+        for (const auto &entry : this->options[sub])
+        {
+            const OptionData &var = entry.second.var;
+
+            // Submenu links and one shot commands carry no state worth keeping
+            if (var.type != TYPE_BOOL && var.type != TYPE_INT)
+                continue;
+
+            file << sub << '|' << entry.first << '='
+                << (var.type == TYPE_BOOL
+                    ? (var.data.boolean ? 1 : 0) : var.data.integer)
+                << '\n';
+        }
+    }
+}
+
+void Menu::LoadSettings()
+{
+    const std::string path = SettingsPath();
+    if (path.empty())
+        return;
+
+    std::ifstream file(path);
+    if (!file)
+        return;
+
+    std::string line;
+    while (std::getline(file, line))
+    {
+        if (line.empty() || line[0] == '#')
+            continue;
+
+        size_t bar = line.find('|');
+        size_t equals = line.rfind('=');
+        if (bar == std::string::npos || equals == std::string::npos || equals < bar)
+            continue;
+
+        int sub = atoi(line.substr(0, bar).c_str());
+        if (sub < 0 || sub >= static_cast<int>(this->options.size()))
+            continue;
+
+        // Options that no longer exist are ignored rather than treated as an
+        // error, so removing one does not invalidate everybody's saved file
+        std::string name = line.substr(bar + 1, equals - bar - 1);
+        auto entry = this->options[sub].find(name);
+        if (entry == this->options[sub].end())
+            continue;
+
+        int value = atoi(line.substr(equals + 1).c_str());
+        OptionData &var = entry->second.var;
+
+        if (var.type == TYPE_BOOL)
+            var.data.boolean = value != 0;
+        else if (var.type == TYPE_INT)
+            var.data.integer = value;
+    }
+}
+
+void Menu::ApplySettings()
+{
+    dvars.at("cg_fov")->current.value =
+        static_cast<float>(this->GetOptionData(MISC_MENU, "FOV").data.integer);
+    dvars.at("sv_cheats")->current.enabled =
+        this->GetOptionData(MISC_MENU, "Enable Cheats").data.boolean;
+    dvars.at("player_sustainAmmo")->current.enabled =
+        this->GetOptionData(MISC_MENU, "Infinite Ammo").data.boolean;
+
+    WriteBytes(0x41DB2B,
+        this->GetOptionData(MISC_MENU, "Super Steady Aim").data.boolean
+        ? "\x90\x90\x90\x90\x90" : "\x83\xFF\x02\x75\x15", 5);
+    WriteBytes(0x46A87E,
+        this->GetOptionData(AIMBOT_MENU, "No Recoil").data.boolean
+        ? "\xEB" : "\x74", 1);
 }
 
 bool Menu::BoolModify(const std::string &varName)
@@ -903,12 +1077,27 @@ void Menu::Execute()
                     option.var.data.boolean ? Colors::blue : Colors::transparentBlack);
                 break;
             case TYPE_INT:
+            {
                 std::string data = std::to_string(option.var.data.integer);
                 RenderUIText(data.data(),
                     AlignText(data.data(), Fonts::normalFont,
                         0.3f, borderX + borderW - 3, ALIGN_RIGHT, 1, 0),
                     optionY, 0.3f, color, fontPointer);
                 break;
+            }
+            case TYPE_TOGGLE:
+            {
+                // Reflects clicks made here, not the game's own state, which it
+                // never reports back. Text rather than a checkbox so it reads
+                // differently from the booleans the menu actually owns.
+                char state[4];
+                strcpy_s(state, option.var.data.boolean ? "On" : "Off");
+                RenderUIText(state,
+                    AlignText(state, Fonts::normalFont,
+                        0.3f, borderX + borderW - 3, ALIGN_RIGHT, 1, 0),
+                    optionY, 0.3f, color, fontPointer);
+                break;
+            }
         }
 
         // Draw the text of the menu
@@ -927,19 +1116,40 @@ bool Menu::MonitorMouse(Option &opt, float optionX, float optionY,
     {
         if (this->Ready())
         {
-            int delay = opt.var.type == TYPE_INT ? 100 : 200;
-            if (GetAsyncKeyState(VK_LBUTTON) & 0x10000)
+            // Numeric options keep hold to repeat, since spinning a value from
+            // one end of its range to the other is the point and repeating one
+            // is harmless. Everything else fires once per press: those callbacks
+            // toggle god mode, run console commands and patch game code, and
+            // reacting to the button being held meant a click that lingered or
+            // drifted a few pixels ran every option it passed over.
+            bool repeat = opt.var.type == TYPE_INT;
+            int delay = repeat ? 100 : 200;
+
+            bool left = repeat
+                ? (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0 : this->leftPressed;
+            bool right = repeat
+                ? (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0 : this->rightPressed;
+
+            if (left)
             {
                 this->toggled = true;
                 opt.callback();
                 this->toggled = false;
                 this->Wait(delay);
             }
-            else if (GetAsyncKeyState(VK_RBUTTON) & 0x10000)
+            else if (right)
             {
                 opt.callback();
                 this->Wait(delay);
             }
+
+            // Persist single click changes straight away so they survive the
+            // game being killed with the menu still open. Numeric options are
+            // left to the save on close, since writing the file on every step
+            // of a hold to repeat would mean a disk write every 100ms from the
+            // render thread.
+            if ((left || right) && !repeat)
+                this->SaveSettings();
         }
         return true;
     }
@@ -948,12 +1158,35 @@ bool Menu::MonitorMouse(Option &opt, float optionX, float optionY,
 
 void Menu::MonitorKeys()
 {
+    // Edge detection lives outside the Ready() gate on purpose. Ready() can be
+    // false for a couple of hundred milliseconds after any input, and if the
+    // key state were only sampled inside it, a press and release landing in
+    // that window would be missed entirely.
+    bool toggleDown = (GetAsyncKeyState(MENU_TOGGLE_KEY) & 0x8000) != 0;
+    bool togglePressed = toggleDown && !this->toggleKeyWasDown;
+    this->toggleKeyWasDown = toggleDown;
+
+    // Same treatment for the mouse, sampled here because MonitorKeys runs once
+    // per frame while MonitorMouse runs once per option
+    bool leftDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    this->leftPressed = leftDown && !this->leftWasDown;
+    this->leftWasDown = leftDown;
+
+    bool rightDown = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+    this->rightPressed = rightDown && !this->rightWasDown;
+    this->rightWasDown = rightDown;
+
     if (this->Ready())
     {
-        if (GetAsyncKeyState(VK_HOME) && !this->open)
+        // One key both shows and hides, from any submenu, matching how every
+        // other overlay behaves.
+        if (togglePressed)
         {
-            this->open = true;
-            this->currentSub = MAIN_MENU;
+            this->open = !this->open;
+            if (this->open)
+                this->currentSub = MAIN_MENU;
+            else
+                this->SaveSettings();
             this->Wait(200);
         }
         if (GetAsyncKeyState(VK_BACK) & 0x10000)
@@ -1131,7 +1364,7 @@ bool InsertDvar(const char *dvarName, GameData::dvar_s *dvar)
     if (!pdvar)
         return false;
 
-    dvars.insert(std::pair<const char *, GameData::dvar_s *>(dvarName, pdvar));
+    dvars.insert(std::pair<std::string, GameData::dvar_s *>(dvarName, pdvar));
     return true;
 }
 

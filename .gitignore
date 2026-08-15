@@ -259,3 +259,9 @@ paket-files/
 # Python Tools for Visual Studio (PTVS)
 __pycache__/
 *.pyc
+# AutoInject runtime logs -- regenerated on every launch, machine-specific noise.
+AutoInject/autoinject.log
+AutoInject/trigger.log
+
+# Local state: present = auto-injection disabled. Not worth syncing.
+AutoInject/disabled.flag
