@@ -116,5 +116,6 @@ felt like they did nothing.
 | `WaWDll/` | The mod menu DLL |
 | `Injector/` | Standalone 32-bit injector, `CreateRemoteThread` + `LoadLibraryA` |
 | `AutoInject/` | Steam launch option auto-injection, see its own README |
+| `Tools/` | Live-process probes, see its own README. Diagnostics, not built |
 | `build.cmd` | Builds the solution as Debug x86 |
 | `WaWDll.cfg` | Written beside the built DLL at runtime; delete to reset settings |

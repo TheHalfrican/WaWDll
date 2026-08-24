@@ -61,6 +61,26 @@ work. Those addresses have been confirmed to match this build: all detour sites
 hold `E9` jumps into the injected DLL's range, and both `WriteBytes` patch sites
 hold their expected original bytes.
 
+`Tools/` exists for this, and both probes have already caught something a guess
+would have got wrong. Read [Tools/README.md](Tools/README.md) before writing a
+new one.
+
+- **`Tools/dvar_probe.py`** reports which member of the `DvarValue` union a dvar
+  actually uses. This is not guessable and **not consistent between dvars**:
+  `g_speed` is an int while `jump_height` and `g_gravity` are floats. Writing
+  the wrong member stores a denormal, so an int `39` into `jump_height` is
+  5.5e-44 and the player cannot jump. **Probe before adding any dvar backed
+  option**, and note that server game dvars are not registered until a map has
+  loaded, so probe from inside a match.
+- **`Tools/field_watch.py`** samples a window of struct fields and prints which
+  ones moved. This is how `fWeaponPosFrac` was finally confirmed. Watch a
+  window, not the single labelled offset: if the label is wrong, this finds the
+  field that is right instead of only telling you the label is wrong.
+
+Much of the struct layout here is the original author's **labels, not facts**,
+and several have turned out wrong. When code is about to depend on one, checking
+costs a minute and guessing has repeatedly cost far more.
+
 ## The failure mode this codebase keeps having
 
 Four separate defects shared one shape: **an unconditional side effect paired
