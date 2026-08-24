@@ -1,6 +1,6 @@
 # Status and open items
 
-Working notes. Last updated 2026-08-14. See [CLAUDE.md](CLAUDE.md) for build and
+Working notes. Last updated 2026-08-24. See [CLAUDE.md](CLAUDE.md) for build and
 tooling guidance.
 
 ## Confirmed working in game
@@ -11,20 +11,13 @@ tooling guidance.
 - Aimbot
 - Clicking and dragging across options no longer fires the ones passed over
 - No more Panzerschreck rockets on every shot
-
-## Built but not yet tested
-
-Everything here compiles and is in the pushed build, but Noah had not exercised
-it before the session ended. **Ask how these went before building on them.**
-
-1. **On/Off indicators** on God Mode, No Clip and No Target
-2. **Aim Key 2**, restricting the aimbot to aiming down sights, with the fix
-   that checks both aim bind names
-3. **Settings persistence** across a full game restart, via `WaWDll.cfg`
-4. **Console starting minimised** rather than stealing focus
-
-Item 4 has already failed twice with different approaches. If minimising also
-fails, the fallback is not creating the console at all in this build.
+- On/Off indicators on God Mode, No Clip and No Target
+- Aim Key 2, restricting the aimbot to aiming down sights
+- Settings persistence across a full game restart, via `WaWDll.cfg`
+- Console starting minimised rather than stealing focus, after two earlier
+  approaches failed
+- **Move Speed**, including sprint scaling with it and the value surviving the
+  start of a new match
 
 ## Unverified assumption
 
@@ -32,6 +25,10 @@ The ADS check depends on `playerState_s::fWeaponPosFrac` at offset `0x0110`
 being the ADS transition fraction, 0 at the hip and 1 fully sighted. **That is
 the original author's label on the struct field, not something confirmed**, and
 this codebase has had several mislabelled things.
+
+Aim Key 2 working does **not** settle this. Hold to ADS is satisfied by the key
+check alone, so it would behave identically with the label wrong; only toggle
+ADS depends on the field.
 
 To verify, with the game running and the user aiming, read:
 
@@ -61,9 +58,32 @@ still works through the key check and only toggle-ADS support is lost.
   it stops the server discarding the retro-edited command as stale is inferred
   from the code's shape, not traced through the netcode.
 
+## Move Speed
+
+Drives `g_speed`, the engine's base movement speed in units per second, which
+walk, sprint and crouch all scale off. Stock is 190, which is also the option's
+off position, so there is no separate boolean to fall out of sync with it.
+
+Two things about `g_speed` shaped the implementation, both confirmed live rather
+than assumed:
+
+- **It is an int dvar**, so `current.integer` is the union member to write, not
+  `current.value`. Probed in a live match: `dvar_s` at `0x021D7804` held
+  `int=190`, while `cg_fov` in the same pool held `float=65`, matching the
+  existing FOV code. Writing the wrong member lands a denormal and the player
+  cannot move at all.
+- **It belongs to the server game module**, so it is not registered until a map
+  loads and cannot go in the `InsertDvar` startup chain, which would hit the
+  `Com_Error` at injection. It is resolved on demand and cached.
+
+`Menu::EnforceMoveSpeed` re-asserts the value from the render thread, because
+`g_speed` is cheat protected and the engine resets it on map load. Gated so an
+option left at stock costs one integer compare per frame and never writes. This
+is the same shape as BO3Z's run speed, where entering a new match rebuilt the
+player struct at the default.
+
 ## Possible next steps
 
-- Test the four items above and report back
 - Confirm `fWeaponPosFrac`
 - Wire up No Spread to the existing `RemoveSpread`
 - Render the game cursor while the menu is open, so it works unpaused

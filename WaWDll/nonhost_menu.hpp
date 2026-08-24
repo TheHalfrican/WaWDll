@@ -462,6 +462,14 @@ struct Menu
     void LoadSub(Submenu sub);
 
     /**
+     * @brief Re-asserts the Move Speed option's value into the g_speed dvar
+     *
+     * Cheap and safe to call every frame; returns immediately unless the
+     * option has been moved off its stock value.
+    **/
+    void EnforceMoveSpeed();
+
+    /**
      * @brief Inverts the value of a varName boolean variable 
      * @param varName The name of the variable being changed
      * @return The result of the variable after the change
@@ -471,9 +479,13 @@ struct Menu
     /**
      * @brief Increments/Decrements the value of a varName integer variable
      * @param varName The name of the variable being changed
+     * @param step How far one click moves the value. A range wide enough that
+     *             stepping by one would take hundreds of clicks passes a
+     *             larger step; the value still wraps at min and max either way
      * @return The result of the variable after the change
     **/
-    int IntModify(const std::string &varName, OptionType type, int min, int max);
+    int IntModify(const std::string &varName, OptionType type, int min, int max,
+        int step = 1);
 
     /**
      * @brief Returns a reference to an option stored in Menu::options

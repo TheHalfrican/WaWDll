@@ -516,6 +516,7 @@ namespace GameData
        // EnterCriticalSection(&menu.critSection);
 
         KeepConsoleMinimized();
+        menu.EnforceMoveSpeed();
 
         if (IN_IsForegroundWindow())
             menu.MonitorKeys();
@@ -658,6 +659,34 @@ Colors::Color Colors::green            = {   0.0f, 255.0f,   0.0f, 255.0f };
 Colors::Color Colors::blue             = {   0.0f,   0.0f, 255.0f, 255.0f };
 Colors::Color Colors::transparentBlack = {   0.0f,   0.0f,   0.0f, 100.0f };
 
+// Stock g_speed, in units per second. Doubles as the Move Speed option's off
+// position, and as the value the engine resets the dvar to.
+static const int MOVE_SPEED_STOCK = 190;
+// Roughly triple speed at the top. One click moves a tenth of the way rather
+// than a 410th, because a numeric option is spun by holding the mouse on it.
+static const int MOVE_SPEED_MAX   = 600;
+static const int MOVE_SPEED_STEP  = 10;
+
+// g_speed belongs to the server game module, which does not register its dvars
+// until a map has loaded, so unlike every dvar in the startup chain it cannot
+// be resolved when the menu is built. Resolved on demand instead, and cached:
+// the dvar pool is static, so the pointer holds for the rest of the process.
+static GameData::dvar_s *MoveSpeedDvar()
+{
+    static GameData::dvar_s *cached = nullptr;
+
+    if (!cached)
+    {
+        auto entry = dvars.find("g_speed");
+        if (entry != dvars.end())
+            cached = entry->second;
+        else if (InsertDvar("g_speed"))
+            cached = dvars.at("g_speed");
+    }
+
+    return cached;
+}
+
 OptionData::OptionData(OptionType type) : type(type)
 {
     switch (type)
@@ -771,6 +800,21 @@ Menu::Menu() :
             dvars.at("cg_fov")->current.value 
                 = static_cast<float>(Menu::Instance().IntModify("FOV", TYPE_INT, 65, 125));
         });
+    // g_speed is the engine's base movement speed in units per second, and
+    // walk, sprint and crouch all scale off it, so this one dvar covers the
+    // lot. MOVE_SPEED_STOCK doubles as this option's "off", which is why there
+    // is no separate boolean to fall out of sync with the number. Written
+    // straight into the dvar rather than through Cbuf_AddText("g_speed <n>")
+    // because g_speed is cheat protected and a direct write skips that, the
+    // same way FOV above does.
+    Insert(MISC_MENU, "Move Speed", TYPE_INT,
+        []()
+        {
+            int speed = Menu::Instance().IntModify("Move Speed", TYPE_INT,
+                MOVE_SPEED_STOCK, MOVE_SPEED_MAX, MOVE_SPEED_STEP);
+            if (GameData::dvar_s *g_speed = MoveSpeedDvar())
+                g_speed->current.integer = speed;
+        });
     Insert(MISC_MENU, "Super Steady Aim", TYPE_BOOL, 
         []() 
         { 
@@ -832,6 +876,7 @@ Menu::Menu() :
         // Defaults first, so a saved file overrides them and a missing one
         // still leaves every option somewhere sensible
         this->GetOptionData(MISC_MENU, "FOV").data.integer = 65;
+        this->GetOptionData(MISC_MENU, "Move Speed").data.integer = MOVE_SPEED_STOCK;
         this->GetOptionData(AIMBOT_MENU, "Aim Key").data.integer = 2;
 
         this->LoadSettings();
@@ -980,6 +1025,7 @@ void Menu::ApplySettings()
         this->GetOptionData(MISC_MENU, "Enable Cheats").data.boolean;
     dvars.at("player_sustainAmmo")->current.enabled =
         this->GetOptionData(MISC_MENU, "Infinite Ammo").data.boolean;
+    this->EnforceMoveSpeed();
 
     WriteBytes(0x41DB2B,
         this->GetOptionData(MISC_MENU, "Super Steady Aim").data.boolean
@@ -989,20 +1035,47 @@ void Menu::ApplySettings()
         ? "\xEB" : "\x74", 1);
 }
 
+// g_speed is cheat protected, so the engine resets it to stock on map load
+// unless sv_cheats is set, and it does not exist at all until the first map
+// loads. Both are answered the same way: re-assert the wanted value from the
+// render thread instead of writing it once and trusting it to stick. This is
+// the same conclusion the BO3Z trainer reached about run speed, where entering
+// a new match rebuilt the player at the default and a one shot write left the
+// menu showing a value the game was not using.
+//
+// Called every frame, so it is gated: an option left at stock costs one
+// integer compare and never resolves a dvar, never writes, and never touches
+// the game. Only a speed the user actually asked for does any work, and even
+// then only when the live value has drifted from it.
+void Menu::EnforceMoveSpeed()
+{
+    int wanted = this->GetOptionData(MISC_MENU, "Move Speed").data.integer;
+    if (wanted == MOVE_SPEED_STOCK)
+        return;
+
+    GameData::dvar_s *g_speed = MoveSpeedDvar();
+    if (!g_speed)
+        return;
+
+    if (g_speed->current.integer != wanted)
+        g_speed->current.integer = wanted;
+}
+
 bool Menu::BoolModify(const std::string &varName)
 {
     OptionData &var = this->GetOptionData(this->currentSub, varName);
     return var.data.boolean = !var.data.boolean;
 }
 
-int Menu::IntModify(const std::string &varName, OptionType type, int min, int max)
+int Menu::IntModify(const std::string &varName, OptionType type, int min, int max,
+    int step)
 {
     OptionData &var = this->GetOptionData(this->currentSub, varName);
 
     if (this->toggled)
-        var.data.integer++;
+        var.data.integer += step;
     else
-        var.data.integer--;
+        var.data.integer -= step;
 
     if (var.data.integer > max)
         var.data.integer = min;
