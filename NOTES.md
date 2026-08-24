@@ -19,25 +19,25 @@ tooling guidance.
 - **Move Speed**, including sprint scaling with it and the value surviving the
   start of a new match
 
-## Unverified assumption
+## Confirmed by reading the live process
 
-The ADS check depends on `playerState_s::fWeaponPosFrac` at offset `0x0110`
-being the ADS transition fraction, 0 at the hip and 1 fully sighted. **That is
-the original author's label on the struct field, not something confirmed**, and
-this codebase has had several mislabelled things.
-
-Aim Key 2 working does **not** settle this. Hold to ADS is satisfied by the key
-check alone, so it would behave identically with the label wrong; only toggle
-ADS depends on the field.
-
-To verify, with the game running and the user aiming, read:
+`playerState_s::fWeaponPosFrac` at offset `0x0110` **is** the ADS transition
+fraction, 0 at the hip and 1 fully sighted. This was the original author's
+label rather than something confirmed, and this codebase has had several
+mislabelled things, so it was sampled directly:
 
 ```
 0x351E060   =   cgameGlob 0x34732B8  +  predictedPlayerState 0xAAC98  +  fWeaponPosFrac 0x110
 ```
 
-It should swing 0 to 1 as the sights come up. If the label is wrong, hold-to-ADS
-still works through the key check and only toggle-ADS support is lost.
+Polled at 20Hz for 20 seconds while alternating hip and sights, it swung
+cleanly between 0.0000 and 1.0000 in step with the sights, and it was the only
+field in the whole `ps+0x0F0` to `ps+0x140` window that moved at all, so there
+is no rival candidate. Toggle ADS support rests on this, and it holds.
+
+Note that Aim Key 2 working in game did not settle this on its own: hold to ADS
+is satisfied by the key check alone and would behave identically with the label
+wrong.
 
 ## Known incomplete, by design
 
@@ -84,7 +84,6 @@ player struct at the default.
 
 ## Possible next steps
 
-- Confirm `fWeaponPosFrac`
 - Wire up No Spread to the existing `RemoveSpread`
 - Render the game cursor while the menu is open, so it works unpaused
 - Audit the remaining options that have never been exercised, on the assumption
