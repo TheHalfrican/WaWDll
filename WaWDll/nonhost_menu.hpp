@@ -462,12 +462,18 @@ struct Menu
     void LoadSub(Submenu sub);
 
     /**
-     * @brief Re-asserts the Move Speed option's value into the g_speed dvar
-     *
-     * Cheap and safe to call every frame; returns immediately unless the
-     * option has been moved off its stock value.
+     * @brief Spins an enforced dvar option and writes the result to its dvar
+     * @param option The option name, which must appear in enforcedDvars
     **/
-    void EnforceMoveSpeed();
+    void EnforcedDvarModify(const char *option);
+
+    /**
+     * @brief Re-asserts every enforced dvar option into its dvar
+     *
+     * Cheap and safe to call every frame; each option costs one integer
+     * compare unless it has been moved off its stock value.
+    **/
+    void EnforceDvars();
 
     /**
      * @brief Inverts the value of a varName boolean variable 

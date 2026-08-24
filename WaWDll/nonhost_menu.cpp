@@ -516,7 +516,7 @@ namespace GameData
        // EnterCriticalSection(&menu.critSection);
 
         KeepConsoleMinimized();
-        menu.EnforceMoveSpeed();
+        menu.EnforceDvars();
 
         if (IN_IsForegroundWindow())
             menu.MonitorKeys();
@@ -659,32 +659,110 @@ Colors::Color Colors::green            = {   0.0f, 255.0f,   0.0f, 255.0f };
 Colors::Color Colors::blue             = {   0.0f,   0.0f, 255.0f, 255.0f };
 Colors::Color Colors::transparentBlack = {   0.0f,   0.0f,   0.0f, 100.0f };
 
-// Stock g_speed, in units per second. Doubles as the Move Speed option's off
-// position, and as the value the engine resets the dvar to.
-static const int MOVE_SPEED_STOCK = 190;
-// Roughly triple speed at the top. One click moves a tenth of the way rather
-// than a 410th, because a numeric option is spun by holding the mouse on it.
-static const int MOVE_SPEED_MAX   = 600;
-static const int MOVE_SPEED_STEP  = 10;
-
-// g_speed belongs to the server game module, which does not register its dvars
-// until a map has loaded, so unlike every dvar in the startup chain it cannot
-// be resolved when the menu is built. Resolved on demand instead, and cached:
-// the dvar pool is static, so the pointer holds for the rest of the process.
-static GameData::dvar_s *MoveSpeedDvar()
+// A menu option driving a dvar that the menu cannot write once and forget.
+// Two problems share one answer:
+//
+//   - These dvars belong to the server game module, which does not register
+//     them until a map has loaded. They cannot go in the InsertDvar startup
+//     chain, because the menu is built lazily on the first paint, at the main
+//     menu, and resolving them there would hit the Com_Error.
+//   - They are cheat protected, so the engine resets them to stock on map load
+//     unless sv_cheats is set.
+//
+// Both are answered by resolving on demand and re-asserting from the render
+// thread, which is what the BO3Z trainer converged on for run speed after a
+// one shot write left its menu showing a value the game was not using.
+//
+// isFloat is the field that earns this struct. DvarValue is a union, and which
+// member the engine reads is not guessable and is NOT consistent between these
+// three: g_speed is an int while jump_height and g_gravity are floats, all
+// confirmed by reading the live process with Tools/dvar_probe.py. Writing the
+// wrong member stores a denormal, so an int 39 into jump_height is 5.5e-44 and
+// the player simply cannot jump.
+struct EnforcedDvar
 {
-    static GameData::dvar_s *cached = nullptr;
+    const char       *dvar;
+    const char       *option;
+    // The value the engine resets to, which is also the option's off position.
+    // It is whichever end of the range means stock, so for gravity it is the
+    // maximum rather than the minimum.
+    int               stock;
+    int               min;
+    int               max;
+    int               step;
+    bool              isFloat;
+    GameData::dvar_s *cached;
+};
 
-    if (!cached)
+// Steps are sized so spinning a range end to end is a second or two of
+// holding the mouse. An earlier pass used fine steps over narrow ranges, and
+// the extremes were then 20 to 30 clicks away, so in practice nobody reached
+// them and both options felt like they did nothing.
+//
+// The ranges are deliberately far past sensible. Jump Height tops out at
+// roughly 20 times stock, and Gravity bottoms out at a sixteenth of it.
+//
+// Gravity descends from its stock 800 because lower is floatier. It is not
+// independent of Jump Height, it multiplies it: observed in game, the lower
+// the gravity the higher the jump as well as the longer the hang time, and at
+// stock gravity raising Jump Height alone does much less than expected. The
+// two are meant to be tuned together, and the useful part of the gravity range
+// is right down at the bottom.
+//
+// Resist the tidy sqrt(2 * gravity * jump_height) reading of the launch
+// velocity, which predicts an apex depending on jump_height alone. That is not
+// what the game does. The interaction above is observed; the mechanism behind
+// it has not been traced through the movement code, so do not write it down as
+// though it had been.
+static EnforcedDvar enforcedDvars[] =
+{
+    { "g_speed",     "Move Speed",  190, 190, 600, 10, false, nullptr },
+    { "jump_height", "Jump Height",  39,  39, 839, 50, true,  nullptr },
+    { "g_gravity",   "Gravity",     800,  50, 800, 50, true,  nullptr },
+};
+
+static EnforcedDvar *FindEnforcedDvar(const char *option)
+{
+    for (EnforcedDvar &enforced : enforcedDvars)
+        if (!strcmp(enforced.option, option))
+            return &enforced;
+
+    return nullptr;
+}
+
+// Cached because the dvar pool is static: once registered, the pointer holds
+// for the rest of the process.
+static GameData::dvar_s *ResolveEnforcedDvar(EnforcedDvar &enforced)
+{
+    if (!enforced.cached)
     {
-        auto entry = dvars.find("g_speed");
+        auto entry = dvars.find(enforced.dvar);
         if (entry != dvars.end())
-            cached = entry->second;
-        else if (InsertDvar("g_speed"))
-            cached = dvars.at("g_speed");
+            enforced.cached = entry->second;
+        else if (InsertDvar(enforced.dvar))
+            enforced.cached = dvars.at(enforced.dvar);
     }
 
-    return cached;
+    return enforced.cached;
+}
+
+// Only writes when the live value differs from the wanted one. Fewer writes
+// means fewer chances to land in the middle of a state transition, which is
+// the same reasoning behind BO3Z's WriteRunSpeedIfChanged.
+static void WriteEnforcedDvar(EnforcedDvar &enforced, int value)
+{
+    GameData::dvar_s *dvar = ResolveEnforcedDvar(enforced);
+    if (!dvar)
+        return;
+
+    if (enforced.isFloat)
+    {
+        float wanted = static_cast<float>(value);
+        if (dvar->current.value != wanted)
+            dvar->current.value = wanted;
+    }
+    else if (dvar->current.integer != value)
+        dvar->current.integer = value;
 }
 
 OptionData::OptionData(OptionType type) : type(type)
@@ -800,20 +878,32 @@ Menu::Menu() :
             dvars.at("cg_fov")->current.value 
                 = static_cast<float>(Menu::Instance().IntModify("FOV", TYPE_INT, 65, 125));
         });
+    // The three below all drive a dvar through the enforcedDvars table, which
+    // owns their ranges and their stock values. Each stock doubles as the
+    // option's off position, so none of them has a separate boolean that could
+    // fall out of sync with the number. They are written straight into the
+    // dvar rather than through Cbuf_AddText, because all three are cheat
+    // protected and a direct write skips that, the same way FOV above does.
+    //
     // g_speed is the engine's base movement speed in units per second, and
-    // walk, sprint and crouch all scale off it, so this one dvar covers the
-    // lot. MOVE_SPEED_STOCK doubles as this option's "off", which is why there
-    // is no separate boolean to fall out of sync with the number. Written
-    // straight into the dvar rather than through Cbuf_AddText("g_speed <n>")
-    // because g_speed is cheat protected and a direct write skips that, the
-    // same way FOV above does.
+    // walk, sprint and crouch all scale off it, so it covers the lot.
     Insert(MISC_MENU, "Move Speed", TYPE_INT,
         []()
         {
-            int speed = Menu::Instance().IntModify("Move Speed", TYPE_INT,
-                MOVE_SPEED_STOCK, MOVE_SPEED_MAX, MOVE_SPEED_STEP);
-            if (GameData::dvar_s *g_speed = MoveSpeedDvar())
-                g_speed->current.integer = speed;
+            Menu::Instance().EnforcedDvarModify("Move Speed");
+        });
+    Insert(MISC_MENU, "Jump Height", TYPE_INT,
+        []()
+        {
+            Menu::Instance().EnforcedDvarModify("Jump Height");
+        });
+    // Lower is floatier. Worth knowing that low gravity plus a high jump makes
+    // it easy to reach geometry the map does not expect, and in Zombies being
+    // stranded where the zombies cannot path to you soft locks the round.
+    Insert(MISC_MENU, "Gravity", TYPE_INT,
+        []()
+        {
+            Menu::Instance().EnforcedDvarModify("Gravity");
         });
     Insert(MISC_MENU, "Super Steady Aim", TYPE_BOOL, 
         []() 
@@ -876,7 +966,9 @@ Menu::Menu() :
         // Defaults first, so a saved file overrides them and a missing one
         // still leaves every option somewhere sensible
         this->GetOptionData(MISC_MENU, "FOV").data.integer = 65;
-        this->GetOptionData(MISC_MENU, "Move Speed").data.integer = MOVE_SPEED_STOCK;
+        for (const EnforcedDvar &enforced : enforcedDvars)
+            this->GetOptionData(MISC_MENU, enforced.option).data.integer
+                = enforced.stock;
         this->GetOptionData(AIMBOT_MENU, "Aim Key").data.integer = 2;
 
         this->LoadSettings();
@@ -1025,7 +1117,7 @@ void Menu::ApplySettings()
         this->GetOptionData(MISC_MENU, "Enable Cheats").data.boolean;
     dvars.at("player_sustainAmmo")->current.enabled =
         this->GetOptionData(MISC_MENU, "Infinite Ammo").data.boolean;
-    this->EnforceMoveSpeed();
+    this->EnforceDvars();
 
     WriteBytes(0x41DB2B,
         this->GetOptionData(MISC_MENU, "Super Steady Aim").data.boolean
@@ -1035,30 +1127,35 @@ void Menu::ApplySettings()
         ? "\xEB" : "\x74", 1);
 }
 
-// g_speed is cheat protected, so the engine resets it to stock on map load
-// unless sv_cheats is set, and it does not exist at all until the first map
-// loads. Both are answered the same way: re-assert the wanted value from the
-// render thread instead of writing it once and trusting it to stick. This is
-// the same conclusion the BO3Z trainer reached about run speed, where entering
-// a new match rebuilt the player at the default and a one shot write left the
-// menu showing a value the game was not using.
+// Spins the option's number and pushes it in immediately, so a click is felt
+// at once rather than waiting on the next enforcement pass.
+void Menu::EnforcedDvarModify(const char *option)
+{
+    EnforcedDvar *enforced = FindEnforcedDvar(option);
+    if (!enforced)
+        return;
+
+    WriteEnforcedDvar(*enforced, this->IntModify(option, TYPE_INT,
+        enforced->min, enforced->max, enforced->step));
+}
+
+// Re-asserts every enforced dvar, because the engine resets cheat protected
+// dvars on map load and none of these exist before the first map loads.
 //
 // Called every frame, so it is gated: an option left at stock costs one
-// integer compare and never resolves a dvar, never writes, and never touches
-// the game. Only a speed the user actually asked for does any work, and even
-// then only when the live value has drifted from it.
-void Menu::EnforceMoveSpeed()
+// integer compare, and never resolves a dvar, writes, or touches the game.
+// Only a value the user actually asked for does any work, and even then only
+// when the live value has drifted from it.
+void Menu::EnforceDvars()
 {
-    int wanted = this->GetOptionData(MISC_MENU, "Move Speed").data.integer;
-    if (wanted == MOVE_SPEED_STOCK)
-        return;
+    for (EnforcedDvar &enforced : enforcedDvars)
+    {
+        int wanted = this->GetOptionData(MISC_MENU, enforced.option).data.integer;
+        if (wanted == enforced.stock)
+            continue;
 
-    GameData::dvar_s *g_speed = MoveSpeedDvar();
-    if (!g_speed)
-        return;
-
-    if (g_speed->current.integer != wanted)
-        g_speed->current.integer = wanted;
+        WriteEnforcedDvar(enforced, wanted);
+    }
 }
 
 bool Menu::BoolModify(const std::string &varName)

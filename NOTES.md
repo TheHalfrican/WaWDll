@@ -18,6 +18,7 @@ tooling guidance.
   approaches failed
 - **Move Speed**, including sprint scaling with it and the value surviving the
   start of a new match
+- **Jump Height** and **Gravity**
 
 ## Confirmed by reading the live process
 
@@ -58,29 +59,48 @@ wrong.
   it stops the server discarding the retro-edited command as stale is inferred
   from the code's shape, not traced through the netcode.
 
-## Move Speed
+## The enforced dvar options
 
-Drives `g_speed`, the engine's base movement speed in units per second, which
-walk, sprint and crouch all scale off. Stock is 190, which is also the option's
-off position, so there is no separate boolean to fall out of sync with it.
+Move Speed, Jump Height and Gravity all run through the `enforcedDvars` table in
+`nonhost_menu.cpp`, which owns their ranges and stock values.
 
-Two things about `g_speed` shaped the implementation, both confirmed live rather
-than assumed:
+| Option | dvar | stock | range | step | written as |
+| --- | --- | --- | --- | --- | --- |
+| Move Speed | `g_speed` | 190 | 190-600 | 10 | **int** |
+| Jump Height | `jump_height` | 39 | 39-839 | 50 | **float** |
+| Gravity | `g_gravity` | 800 | 50-800 | 50 | **float** |
 
-- **It is an int dvar**, so `current.integer` is the union member to write, not
-  `current.value`. Probed in a live match: `dvar_s` at `0x021D7804` held
-  `int=190`, while `cg_fov` in the same pool held `float=65`, matching the
-  existing FOV code. Writing the wrong member lands a denormal and the player
-  cannot move at all.
-- **It belongs to the server game module**, so it is not registered until a map
-  loads and cannot go in the `InsertDvar` startup chain, which would hit the
-  `Com_Error` at injection. It is resolved on demand and cached.
+Each stock doubles as the option's off position, so none of them has a separate
+boolean that can fall out of sync with the number. Gravity's stock is the top of
+its range, since lower is floatier.
 
-`Menu::EnforceMoveSpeed` re-asserts the value from the render thread, because
-`g_speed` is cheat protected and the engine resets it on map load. Gated so an
-option left at stock costs one integer compare per frame and never writes. This
-is the same shape as BO3Z's run speed, where entering a new match rebuilt the
-player struct at the default.
+Three things shaped this, all confirmed by reading the live process rather than
+assumed. Use `Tools/dvar_probe.py`.
+
+- **Which union member to write is not guessable, and is not consistent.**
+  `g_speed` is an int dvar while `jump_height` and `g_gravity` are floats. That
+  is what the `isFloat` column exists for. Writing the wrong member stores a
+  denormal: an int `39` into `jump_height` is 5.5e-44 and the player cannot
+  jump at all.
+- **They belong to the server game module**, so they are not registered until a
+  map loads and cannot go in the `InsertDvar` startup chain, which would hit
+  the `Com_Error` at injection. They are resolved on demand and cached.
+- **They are cheat protected**, so the engine resets them on map load.
+  `Menu::EnforceDvars` re-asserts them from the render thread, gated so an
+  option left at stock costs one integer compare per frame and never writes.
+  Same shape as BO3Z's run speed, where entering a new match rebuilt the player
+  struct at the default.
+
+**Gravity multiplies Jump Height rather than being independent of it.** Observed
+in game: the lower the gravity, the higher the jump as well as the longer the
+hang time, and at stock gravity raising Jump Height alone does much less than
+expected. They are meant to be tuned together. The mechanism has not been traced
+through the movement code, so treat the interaction as observed behaviour and
+nothing more.
+
+An earlier pass gave Jump Height and Gravity fine steps over narrow ranges. The
+extremes were then 20 to 30 clicks away, nobody reached them, and both options
+felt like they did nothing.
 
 ## Possible next steps
 
